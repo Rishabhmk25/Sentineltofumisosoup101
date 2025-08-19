@@ -7,6 +7,7 @@
     "start": "node src/server.js",
     "dev": "nodemon src/server.js",
     "dev:legacy": "nodemon src/server.js",
+    "setup": "node setup.js",
     "lint": "eslint src/",
     "lint:fix": "eslint src/ --fix",
     "format": "prettier --write src/",
@@ -15,7 +16,8 @@
     "docker:run": "docker run -p 5001:5001 cybercrime-backend",
     "db:migrate": "node scripts/migrate.js",
     "db:seed": "node scripts/seed.js",
-    "health": "curl http://localhost:5001/health"
+    "health": "curl http://localhost:5001/health",
+    "help": "echo 'Available commands: npm start, npm run dev, npm run setup, npm run health'"
   },
   "keywords": [
     "cybercrime",
