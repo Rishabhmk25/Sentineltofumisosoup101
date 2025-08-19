@@ -8,6 +8,11 @@ import { sql } from "./config/db.js";
 import { Clerk } from '@clerk/clerk-sdk-node';
 import { AIService } from "./services/AIService.js";
 import fetch from "node-fetch";
+import "dotenv/config";
+import rateLimiter from "./middleware/rateLimiter.js";
+import jwt from "jsonwebtoken";
+import nodemailer from "nodemailer";
+import requestIp from "request-ip";
 
 // Temporary no-op auth middleware to avoid runtime errors
 // Replace with real Clerk route middleware when wiring sessions
@@ -51,6 +56,20 @@ async function initDB() {
       WHEN duplicate_object THEN null;
     END $$;`;
     console.log("✅ ENUM 'role' checked/created successfully.");
+
+    // Ensure OFFICER value exists in role enum
+    await sql`DO $$ BEGIN
+      IF NOT EXISTS (
+        SELECT 1 FROM pg_type t
+        JOIN pg_enum e ON t.oid = e.enumtypid
+        WHERE t.typname = 'role' AND e.enumlabel = 'OFFICER'
+      ) THEN
+        ALTER TYPE role ADD VALUE 'OFFICER';
+      END IF;
+    EXCEPTION
+      WHEN duplicate_object THEN null;
+    END $$;`;
+    console.log("✅ Enum 'role' includes OFFICER.");
 
     // Create users table
     await sql`CREATE TABLE IF NOT EXISTS users (
@@ -165,6 +184,24 @@ async function initDB() {
     );`;
     console.log("✅ Table 'learnbot_requests' checked/created successfully.");
 
+    // Data requests table for lawful data requests
+    await sql`CREATE TABLE IF NOT EXISTS data_requests (
+      request_id VARCHAR(255) PRIMARY KEY,
+      officer_id VARCHAR(255) REFERENCES users(user_id) ON DELETE SET NULL,
+      case_id VARCHAR(255) NOT NULL,
+      service_provider VARCHAR(255) NOT NULL,
+      required_data JSONB NOT NULL,
+      legal_basis TEXT,
+      transport VARCHAR(10) DEFAULT 'email' CHECK (transport IN ('email','pdf')),
+      email_status VARCHAR(50) DEFAULT 'pending' CHECK (email_status IN ('pending','sent','failed')),
+      pdf_url TEXT,
+      created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+    );`;
+
+    await sql`CREATE INDEX IF NOT EXISTS idx_data_requests_officer ON data_requests(officer_id);`;
+    await sql`CREATE INDEX IF NOT EXISTS idx_data_requests_provider ON data_requests(service_provider);`;
+
     // Create admin-specific tables
     await sql`CREATE TABLE IF NOT EXISTS admin_dashboard_stats (
       stat_id SERIAL PRIMARY KEY,
@@ -232,6 +269,9 @@ app.use(compression());
 app.use(bodyParser.json({ limit: '10mb' }));
 app.use(bodyParser.urlencoded({ extended: true, limit: '10mb' }));
 
+// Apply rate limiter to AI routes
+app.use('/api/ai', rateLimiter);
+
 // Initialize Clerk client (used where needed)
 const clerk = new Clerk({ secretKey: process.env.CLERK_SECRET_KEY });
 
@@ -246,6 +286,164 @@ app.use((req, res, next) => {
 });
 
 // Inline routes will be defined below under /api
+
+// =====================
+// Officer Auth (JWT)
+// =====================
+
+const JWT_SECRET = process.env.JWT_SECRET || 'dev_secret';
+
+function requireOfficer(req, res, next) {
+  try {
+    const auth = req.headers.authorization || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : null;
+    if (!token) return res.status(401).json({ message: 'Missing token' });
+    const decoded = jwt.verify(token, JWT_SECRET);
+    if (!decoded || decoded.role !== 'OFFICER') {
+      return res.status(403).json({ message: 'Officer role required' });
+    }
+    req.officer = decoded;
+    next();
+  } catch (e) {
+    return res.status(401).json({ message: 'Invalid token' });
+  }
+}
+
+// Issue officer token (simple demo)
+app.post('/api/officer/login', async (req, res) => {
+  const { user_id } = req.body;
+  if (!user_id) return res.status(400).json({ message: 'user_id required' });
+  const users = await sql`SELECT user_id, role FROM users WHERE user_id = ${user_id}`;
+  if (users.length === 0) return res.status(404).json({ message: 'User not found' });
+  if (users[0].role !== 'OFFICER') return res.status(403).json({ message: 'Not an officer' });
+  const token = jwt.sign({ user_id, role: 'OFFICER' }, JWT_SECRET, { expiresIn: '12h' });
+  res.json({ token });
+});
+
+// =====================
+// MailerSend SMTP (Nodemailer)
+// =====================
+
+const mailTransport = nodemailer.createTransport({
+  host: process.env.MAILERSEND_SMTP_HOST || 'smtp.mailersend.net',
+  port: parseInt(process.env.MAILERSEND_SMTP_PORT || '587', 10),
+  secure: false,
+  auth: {
+    user: process.env.MAILERSEND_SMTP_USER,
+    pass: process.env.MAILERSEND_SMTP_PASS,
+  },
+});
+
+// =====================
+// Data Request Endpoints
+// =====================
+
+app.post('/api/data-request', requireOfficer, async (req, res) => {
+  try {
+    const { case_id, service_provider, required_data, legal_basis, transport = 'email' } = req.body;
+    if (!case_id || !service_provider || !required_data) {
+      return res.status(400).json({ message: 'case_id, service_provider, required_data are required' });
+    }
+    const request_id = `DR-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+    await sql`
+      INSERT INTO data_requests (request_id, officer_id, case_id, service_provider, required_data, legal_basis, transport)
+      VALUES (${request_id}, ${req.officer.user_id}, ${case_id}, ${service_provider}, ${sql.json(required_data)}, ${legal_basis || null}, ${transport})
+    `;
+
+    let email_status = 'pending';
+    if (transport === 'email') {
+      try {
+        const mailTo = process.env.MAILERSEND_TO || 'legal@' + (service_provider || 'provider.com');
+        await mailTransport.sendMail({
+          from: process.env.MAILERSEND_FROM || 'lesgo <no-reply@mailersend.net>',
+          to: mailTo,
+          subject: `Lawful Data Request - Case ${case_id}`,
+          text: `Officer ${req.officer.user_id} requests data. Provider: ${service_provider}. Legal basis: ${legal_basis || 'N/A'}. Required data: ${JSON.stringify(required_data, null, 2)}`,
+        });
+        email_status = 'sent';
+      } catch (e) {
+        email_status = 'failed';
+      }
+      await sql`UPDATE data_requests SET email_status = ${email_status}, updated_at = CURRENT_TIMESTAMP WHERE request_id = ${request_id}`;
+    }
+
+    const saved = await sql`SELECT * FROM data_requests WHERE request_id = ${request_id}`;
+    res.status(201).json({ request: saved[0] });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+app.get('/api/data-requests', requireOfficer, async (req, res) => {
+  try {
+    const rows = await sql`SELECT * FROM data_requests WHERE officer_id = ${req.officer.user_id} ORDER BY created_at DESC`;
+    res.json({ requests: rows });
+  } catch (error) {
+    res.status(500).json({ message: 'Internal server error' });
+  }
+});
+
+// =====================
+// FingerprintJS + IPinfo collection
+// =====================
+
+const FINGERPRINT_API_KEY = process.env.FINGERPRINT_API_KEY || process.env.FINGERPRINT_KEY;
+const IPINFO_TOKEN = process.env.IPINFO_TOKEN;
+
+app.get('/api/collect', async (req, res) => {
+  try {
+    const ip = requestIp.getClientIp(req) || '8.8.8.8';
+    const { requestId } = req.query;
+
+    let visitorId = null;
+    let browser = 'Unknown';
+    let os = 'Unknown';
+    let device = 'Unknown';
+
+    if (requestId && FINGERPRINT_API_KEY) {
+      try {
+        const fpRes = await fetch(`https://api.fpjs.io/events/${requestId}?api_key=${FINGERPRINT_API_KEY}`);
+        const data = await fpRes.json();
+        visitorId = data.visitorId || null;
+        browser = data.products?.identification?.data?.browser?.name || browser;
+        os = data.products?.identification?.data?.os?.name || os;
+        device = data.products?.identification?.data?.device?.category || device;
+      } catch {}
+    }
+
+    const ipinfoRes = await fetch(`https://ipinfo.io/${ip}?token=${IPINFO_TOKEN || ''}`);
+    const ipinfo = await ipinfoRes.json();
+
+    const result = {
+      visitorId,
+      ip,
+      browser,
+      os,
+      device,
+      location: {
+        city: ipinfo?.city,
+        region: ipinfo?.region,
+        country: ipinfo?.country,
+        org: ipinfo?.org,
+      },
+      privacy: ipinfo?.privacy || { vpn: false, proxy: false, tor: false, hosting: false },
+    };
+
+    try {
+      const vpnDetected = String(result.privacy?.vpn ?? false);
+      const location = result.location?.city || null;
+      await sql`
+        INSERT INTO visitor_logs (visitor_id, ip, vpn_detected, location, device, browser)
+        VALUES (${result.visitorId}, ${ip}, ${vpnDetected}, ${location}, ${device}, ${browser})
+      `;
+    } catch {}
+
+    res.json(result);
+  } catch (err) {
+    console.error('❌ Error in /api/collect:', err);
+    res.status(500).json({ error: 'Failed to fetch visitor data' });
+  }
+});
 
 // Health and Home routes
 app.get('/health', (req, res) => {

@@ -107,8 +107,14 @@ for df in [db1, db2]:
         else:
             df[field] = df[field].apply(db.normalize_field)
 
-cross = db.cross_db_match(db1, db2, threshold=0.5)
-within = db.within_db_match(db1, threshold=0.3)
+# Read thresholds from stdin payload
+payload = json.loads(sys.stdin.read() or '{}')
+thresholds = payload.get('thresholds', {}) if isinstance(payload, dict) else {}
+cross_th = thresholds.get('cross_threshold', 0.5)
+within_th = thresholds.get('within_threshold', 0.3)
+
+cross = db.cross_db_match(db1, db2, threshold=cross_th)
+within = db.within_db_match(db1, threshold=within_th)
 print(json.dumps({"cross_db_matches": cross, "within_db_matches": within}))
 `;
       return await AIService.#runPythonInline(pythonCode, entityData);
@@ -270,25 +276,43 @@ print(json.dumps({"analysis": analysis, "has_contradiction": has_contradiction})
 import sys, json, os
 sys.path.append(${JSON.stringify(callDetectorDir)})
 from call import analyze_text_with_groq
-import requests
-import os
+from vosk import Model, KaldiRecognizer
+from pydub import AudioSegment
 
 data = json.loads(sys.stdin.read() or '{}')
 audio_file_path = data.get('audio_file_path', '')
-language = data.get('language', 'en')
+language = (data.get('language') or 'en').lower()
 
 if not audio_file_path or not os.path.exists(audio_file_path):
     print(json.dumps({"error": "Audio file not found"}))
-    exit()
+    raise SystemExit(0)
 
-# For now, we'll simulate the transcription and analysis
-# In a real implementation, you'd use the Vosk model for transcription
-# and then analyze the transcript with Groq
+# Select Vosk model directory
+vosk_model_path = os.path.join(${JSON.stringify(callDetectorDir)}, 'model-hi' if language.startswith('hi') else 'model-en')
+if not os.path.exists(vosk_model_path):
+    print(json.dumps({"error": f"Vosk model not found at {vosk_model_path}"}))
+    raise SystemExit(0)
 
-# Simulate transcript (replace with actual Vosk transcription)
-transcript = "Hello, this is a test call transcript for scam detection."
+# Load audio and transcribe
+try:
+    audio = AudioSegment.from_file(audio_file_path)
+    audio = audio.set_frame_rate(16000).set_channels(1)
+    model = Model(vosk_model_path)
+    recognizer = KaldiRecognizer(model, 16000)
+    recognizer.AcceptWaveform(audio.raw_data)
+    import json as _json
+    result_json = recognizer.FinalResult()
+    result = _json.loads(result_json)
+    transcript = result.get('text', '').strip()
+except Exception as e:
+    print(json.dumps({"error": f"Transcription failed: {e}"}))
+    raise SystemExit(0)
 
-# Analyze with Groq
+# Fallback if no transcript
+if not transcript:
+    transcript = ""
+
+# Analyze with Groq LLM
 classification, reason = analyze_text_with_groq(transcript)
 
 print(json.dumps({
@@ -332,7 +356,7 @@ pdf_text = extract_text_from_pdf(pdf_path) if pdf_path else ''
 audio_text = extract_text_from_audio(audio_path) if audio_path else ''
 video_details = extract_details_from_video(video_path) if video_path else {"transcribed_audio": "", "text_from_frames": []}
 text_from_video_audio = video_details.get('transcribed_audio', '')
-text_from_video_frames = ' '.join(video_details.get('text_from_video_frames', []))
+text_from_video_frames = ' '.join(video_details.get('text_from_frames', []))
 
 # Check for contradictions
 contradiction_analysis, has_contradiction = contradiction_in_complain_and_evidences(
