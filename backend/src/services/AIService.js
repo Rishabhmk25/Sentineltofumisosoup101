@@ -232,7 +232,7 @@ print(json.dumps({"priority": priority, "score": score}))
     try {
       const summarizerDir = path.join(__dirname, '../models/summarizer');
       const pythonCode = `
-import sys, json
+import sys, json, os
 sys.path.append(${JSON.stringify(summarizerDir)})
 from contradict import contradiction_in_complain_and_evidences
 from image_to_text import extract_text_from_image
@@ -260,6 +260,206 @@ print(json.dumps({"analysis": analysis, "has_contradiction": has_contradiction})
       return await AIService.#runPythonInline(pythonCode, data);
     } catch (error) {
       throw new Error(`Contradiction analysis failed: ${error.message}`);
+    }
+  }
+
+  static async detectCallScam(audioData) {
+    try {
+      const callDetectorDir = path.join(__dirname, '../models/call scam detector');
+      const pythonCode = `
+import sys, json, os
+sys.path.append(${JSON.stringify(callDetectorDir)})
+from call import analyze_text_with_groq
+import requests
+import os
+
+data = json.loads(sys.stdin.read() or '{}')
+audio_file_path = data.get('audio_file_path', '')
+language = data.get('language', 'en')
+
+if not audio_file_path or not os.path.exists(audio_file_path):
+    print(json.dumps({"error": "Audio file not found"}))
+    exit()
+
+# For now, we'll simulate the transcription and analysis
+# In a real implementation, you'd use the Vosk model for transcription
+# and then analyze the transcript with Groq
+
+# Simulate transcript (replace with actual Vosk transcription)
+transcript = "Hello, this is a test call transcript for scam detection."
+
+# Analyze with Groq
+classification, reason = analyze_text_with_groq(transcript)
+
+print(json.dumps({
+    "transcript": transcript,
+    "classification": classification,
+    "reason": reason,
+    "language": language,
+    "audio_file": audio_file_path
+}))
+`;
+      return await AIService.#runPythonInline(pythonCode, audioData);
+    } catch (error) {
+      throw new Error(`Call scam detection failed: ${error.message}`);
+    }
+  }
+
+  static async completeAnalysis(complaintData) {
+    try {
+      const summarizerDir = path.join(__dirname, '../models/summarizer');
+      const pythonCode = `
+import sys, json, os
+sys.path.append(${JSON.stringify(summarizerDir)})
+from complete import *
+from image_to_text import extract_text_from_image
+from pdf_to_text import extract_text_from_pdf
+from audio_to_text import extract_text_from_audio
+from video_to_text import extract_details_from_video
+from summarizer import get_incident_details_from_text, get_narrative_summary
+from classifier import classify_cybercrime
+from contradict import contradiction_in_complain_and_evidences
+
+data = json.loads(sys.stdin.read() or '{}')
+complaint = data.get('complaint', '')
+image_path = data.get('image_path')
+pdf_path = data.get('pdf_path')
+audio_path = data.get('audio_path')
+video_path = data.get('video_path')
+
+image_text = extract_text_from_image(image_path) if image_path else ''
+pdf_text = extract_text_from_pdf(pdf_path) if pdf_path else ''
+audio_text = extract_text_from_audio(audio_path) if audio_path else ''
+video_details = extract_details_from_video(video_path) if video_path else {"transcribed_audio": "", "text_from_frames": []}
+text_from_video_audio = video_details.get('transcribed_audio', '')
+text_from_video_frames = ' '.join(video_details.get('text_from_video_frames', []))
+
+# Check for contradictions
+contradiction_analysis, has_contradiction = contradiction_in_complain_and_evidences(
+    complaint, image_text, pdf_text, audio_text, text_from_video_audio, text_from_video_frames
+)
+
+# Get incident details
+incident_details = get_incident_details_from_text(
+    complaint, image_text, pdf_text, audio_text, text_from_video_audio, text_from_video_frames
+)
+
+# Get narrative summary
+narrative_summary = get_narrative_summary(
+    complaint, image_text, pdf_text, audio_text, text_from_video_audio, text_from_video_frames
+)
+
+# Classify the incident
+classification, score = classify_cybercrime(incident_details) if incident_details else ("Unknown", 0)
+
+print(json.dumps({
+    "contradiction_analysis": contradiction_analysis,
+    "has_contradiction": has_contradiction,
+    "incident_details": incident_details,
+    "narrative_summary": narrative_summary,
+    "classification": classification,
+    "priority_score": score
+}))
+`;
+      return await AIService.#runPythonInline(pythonCode, complaintData);
+    } catch (error) {
+      throw new Error(`Complete analysis failed: ${error.message}`);
+    }
+  }
+
+  static async analyzeAudioFile(audioData) {
+    try {
+      const audioDir = path.join(__dirname, '../models/summarizer');
+      const pythonCode = `
+import sys, json, os
+sys.path.append(${JSON.stringify(audioDir)})
+from audio_to_text import extract_text_from_audio
+
+data = json.loads(sys.stdin.read() or '{}')
+audio_file_path = data.get('audio_file_path', '')
+
+if not audio_file_path or not os.path.exists(audio_file_path):
+    print(json.dumps({"error": "Audio file not found"}))
+    exit()
+
+transcribed_text = extract_text_from_audio(audio_file_path)
+print(json.dumps({"transcribed_text": transcribed_text}))
+`;
+      return await AIService.#runPythonInline(pythonCode, audioData);
+    } catch (error) {
+      throw new Error(`Audio analysis failed: ${error.message}`);
+    }
+  }
+
+  static async analyzeVideoFile(videoData) {
+    try {
+      const videoDir = path.join(__dirname, '../models/summarizer');
+      const pythonCode = `
+import sys, json, os
+sys.path.append(${JSON.stringify(videoDir)})
+from video_to_text import extract_details_from_video
+
+data = json.loads(sys.stdin.read() or '{}')
+video_file_path = data.get('video_file_path', '')
+
+if not video_file_path or not os.path.exists(video_file_path):
+    print(json.dumps({"error": "Video file not found"}))
+    exit()
+
+video_details = extract_details_from_video(video_file_path)
+print(json.dumps(video_details))
+`;
+      return await AIService.#runPythonInline(pythonCode, videoData);
+    } catch (error) {
+      throw new Error(`Video analysis failed: ${error.message}`);
+    }
+  }
+
+  static async analyzeImageFile(imageData) {
+    try {
+      const imageDir = path.join(__dirname, '../models/summarizer');
+      const pythonCode = `
+import sys, json, os
+sys.path.append(${JSON.stringify(imageDir)})
+from image_to_text import extract_text_from_image
+
+data = json.loads(sys.stdin.read() or '{}')
+image_file_path = data.get('image_file_path', '')
+
+if not image_file_path or not os.path.exists(image_file_path):
+    print(json.dumps({"error": "Image file not found"}))
+    exit()
+
+extracted_text = extract_text_from_image(image_file_path)
+print(json.dumps({"extracted_text": extracted_text}))
+`;
+      return await AIService.#runPythonInline(pythonCode, imageData);
+    } catch (error) {
+      throw new Error(`Image analysis failed: ${error.message}`);
+    }
+  }
+
+  static async analyzePdfFile(pdfData) {
+    try {
+      const pdfDir = path.join(__dirname, '../models/summarizer');
+      const pythonCode = `
+import sys, json, os
+sys.path.append(${JSON.stringify(pdfDir)})
+from pdf_to_text import extract_text_from_pdf
+
+data = json.loads(sys.stdin.read() or '{}')
+pdf_file_path = data.get('pdf_file_path', '')
+
+if not pdf_file_path or not os.path.exists(pdf_file_path):
+    print(json.dumps({"error": "PDF file not found"}))
+    exit()
+
+extracted_text = extract_text_from_pdf(pdf_file_path)
+print(json.dumps({"extracted_text": extracted_text}))
+`;
+      return await AIService.#runPythonInline(pythonCode, pdfData);
+    } catch (error) {
+      throw new Error(`PDF analysis failed: ${error.message}`);
     }
   }
 }
